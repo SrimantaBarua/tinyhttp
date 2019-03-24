@@ -29,7 +29,8 @@
 
 
 // Current working directory. This is the root of HTTP server
-const char *CWD = NULL;
+char   *CWD = NULL;
+size_t CWDSZ = 0;
 
 
 // Information about a client
@@ -470,10 +471,15 @@ int main(int argc, const char **argv) {
 	}
 	fprintf(stderr, "[INFO]: Server started listening on port: %s\n", argv[1]);
 	// Get CWD
-	if (!(CWD = get_current_dir_name())) {
-		perror("[ERROR]: get_current_dir_name()");
-		close(sock);
-		return 1;
+	while (1) {
+		if (!(CWD = malloc(CWDSZ + 64))) {
+			perror("[ERROR]: malloc()");
+			return 1;
+		}
+		CWDSZ += 64;
+		if (getcwd(CWD, CWDSZ)) {
+			break;
+		}
 	}
 	while (1) {
 		addr_size = sizeof(client_addr);
