@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <ctype.h>
 #include <errno.h>
 #include <unistd.h>
@@ -91,8 +92,10 @@ static int send_dir(struct client *client, const char *path, const char *proto, 
 	struct dirent *ent;
 	time_t t;
 	struct tm tm;
-	char date[64];
+	char date[64], *entpath = NULL;
+	struct stat stat;
 	int ret;
+	bool isdir;
 
 	// Get time
 	t = time(NULL);
@@ -108,6 +111,20 @@ static int send_dir(struct client *client, const char *path, const char *proto, 
 	while ((ent = readdir(dir))) {
 		len += 2 * strlen(ent->d_name); // Path + link
 		len += 26; // HTML
+		if (ent->d_type == DT_DIR) {
+			len++;
+		} else if (ent->d_type == DT_UNKNOWN) {
+			if (asprintf(&entpath, "%s/%s", path, ent->d_name) < 0) {
+				perror("[ERROR]: asprintf()");
+				continue;
+			}
+			if (!lstat(entpath, &stat)) {
+				if (S_ISDIR(stat.st_mode)) {
+					len++;
+				}
+			}
+			free(entpath);
+		}
 	}
 	closedir(dir);
 	len += 31 + 278 + strlen(uri);
@@ -144,8 +161,24 @@ static int send_dir(struct client *client, const char *path, const char *proto, 
 	}
 	client->wbuf_len = 0;
 	while ((ent = readdir(dir))) {
+		isdir = false;
+		if (ent->d_type == DT_DIR) {
+			isdir = true;
+		} else if (ent->d_type == DT_UNKNOWN) {
+			if (asprintf(&entpath, "%s/%s", path, ent->d_name) < 0) {
+				perror("[ERROR]: asprintf()");
+				continue;
+			}
+			if (!lstat(entpath, &stat)) {
+				if (S_ISDIR(stat.st_mode)) {
+					isdir = true;
+				}
+			}
+			free(entpath);
+		}
 		ret = snprintf(client->wbuf + client->wbuf_len, BUFSZ - client->wbuf_len,
-				"<li><a href=\"%s\">%s</a></li>\r\n", ent->d_name, ent->d_name);
+				"<li><a href=\"%s%s\">%s%s</a></li>\r\n", ent->d_name,
+				isdir ? "/" : "", ent->d_name, isdir ? "/" : "");
 		if (ret >= (int) (BUFSZ - client->wbuf_len)) {
 			client->wbuf[client->wbuf_len] = '\0';
 			while (write(client->fd, client->wbuf, client->wbuf_len) < 0) {
@@ -157,8 +190,9 @@ static int send_dir(struct client *client, const char *path, const char *proto, 
 			}
 			client->wbuf_len = 0;
 			ret = snprintf(client->wbuf + client->wbuf_len, BUFSZ - client->wbuf_len,
-					"<li><a href=\"%s\">%s</a></li>\r\n",
-					ent->d_name, ent->d_name);
+					"<li><a href=\"%s%s\">%s%s</a></li>\r\n",
+					ent->d_name, isdir ? "/" : "", ent->d_name,
+					isdir ? "/" : "");
 		}
 		client->wbuf_len += ret;
 	}
