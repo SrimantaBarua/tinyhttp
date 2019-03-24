@@ -9,11 +9,13 @@
 #include <errno.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <dirent.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 
 
 #define SERVER_NAME    "tinyhttp"
@@ -58,13 +60,13 @@ static int get_socket(const char *port, int backlog) {
 			perror("[ERROR]: socket()");
 			continue;
 		}
-		if (bind(sock, res->ai_addr, res->ai_addrlen) < 0) {
-			perror("[ERROR]: bind()");
+		if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) {
+			perror("[ERROR]: setsockopt()");
 			close(sock);
 			continue;
 		}
-		if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) {
-			perror("[ERROR]: setsockopt()");
+		if (bind(sock, res->ai_addr, res->ai_addrlen) < 0) {
+			perror("[ERROR]: bind()");
 			close(sock);
 			continue;
 		}
@@ -82,26 +84,96 @@ static int get_socket(const char *port, int backlog) {
 }
 
 
-// Send response to GET request
-static void send_get_response(struct client *client, const char *uri, const char *proto,
-		const char *ipstr, unsigned port) {
+// List directory
+static int send_dir(struct client *client, const char *path, const char *proto, const char *uri) {
+	DIR *dir;
+	size_t len = 0;
+	struct dirent *ent;
 	time_t t;
 	struct tm tm;
-	char date[64], *path;
-	// Get path
-	if (asprintf(&path, "%s/%s", CWD, uri) < 0) {
-		perror("[ERROR]: asprintf()");
-		return;
-	}
-	free(path);
-	// Send 404
+	char date[64];
+	int ret;
+
+	// Get time
 	t = time(NULL);
 	gmtime_r(&t, &tm);
 	strftime(date, sizeof(date), "%a, %d %b %y %H:%M:%S", &tm);
-	client->wbuf_len = snprintf(client->wbuf, BUFSZ,
-			"%s 404 Not Found\r\nServer: %s %s\r\nDate: %s\r\n\r\n",
-			proto, SERVER_NAME, SERVER_VER, date);
-	fprintf(stderr, "[INFO]: Response to client: %s:%u\n%s\n", ipstr, port, client->wbuf);
+
+	// Get length
+	if (!(dir = opendir(path))) {
+		perror("[ERROR]: opendir()");
+		return -1;
+	}
+	// Content length
+	while ((ent = readdir(dir))) {
+		len += 2 * strlen(ent->d_name); // Path + link
+		len += 26; // HTML
+	}
+	closedir(dir);
+	len += 31 + 278 + strlen(uri);
+	// Write HTTP header and beginning message
+	client->wbuf_len = snprintf(client->wbuf, BUFSZ, "%s 200 OK\r\n"
+					"Server: %s %s\r\n"
+					"Date: %s\r\n"
+					"Content-type: text/html; charset=utf-8\r\n"
+					"Content-Length: %lu\r\n\r\n"
+					"<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01//EN\" "
+					"\"http://www.w3.org/TR/html4/strict.dtd\">\r\n"
+					"<html>\r\n"
+					"<head>\r\n"
+					"<meta http-equiv=\"Content-Type\"content=\"text/html; "
+					"charset=utf-8\">\r\n"
+					"<title>Directory listing for %s</title>\r\n"
+					"</head>\r\n"
+					"<body>\r\n"
+					"<h1>Directory listing for %s</h1>\r\n"
+					"<hr>\r\n"
+					"<ul>\r\n",
+					proto, SERVER_NAME, SERVER_VER, date, len, uri, uri);
+	while (write(client->fd, client->wbuf, client->wbuf_len) < 0) {
+		if (errno == EAGAIN) {
+			continue;
+		}
+		perror("[ERROR]: write()");
+		return -1;
+	}
+	// Dir listing
+	if (!(dir = opendir(path))) {
+		perror("[ERROR]: opendir()");
+		return -1;
+	}
+	client->wbuf_len = 0;
+	while ((ent = readdir(dir))) {
+		ret = snprintf(client->wbuf + client->wbuf_len, BUFSZ - client->wbuf_len,
+				"<li><a href=\"%s\">%s</a></li>\r\n", ent->d_name, ent->d_name);
+		if (ret >= (int) (BUFSZ - client->wbuf_len)) {
+			client->wbuf[client->wbuf_len] = '\0';
+			while (write(client->fd, client->wbuf, client->wbuf_len) < 0) {
+				if (errno == EAGAIN) {
+					continue;
+				}
+				perror("[ERROR]: write()");
+				return -1;
+			}
+			client->wbuf_len = 0;
+			ret = snprintf(client->wbuf + client->wbuf_len, BUFSZ - client->wbuf_len,
+					"<li><a href=\"%s\">%s</a></li>\r\n",
+					ent->d_name, ent->d_name);
+		}
+		client->wbuf_len += ret;
+	}
+	closedir(dir);
+	if (client->wbuf_len > 0) {
+		while (write(client->fd, client->wbuf, client->wbuf_len) < 0) {
+			if (errno == EAGAIN) {
+				continue;
+			}
+			perror("[ERROR]: write()");
+			return -1;
+		}
+	}
+	// End HTML
+	client->wbuf_len = snprintf(client->wbuf, BUFSZ, "</ul>\r\n""<hr>\r\n</body>\r\n</html>\r\n");
 	while (write(client->fd, client->wbuf, client->wbuf_len) < 0) {
 		if (errno == EAGAIN) {
 			continue;
@@ -109,12 +181,151 @@ static void send_get_response(struct client *client, const char *uri, const char
 		perror("[ERROR]: write()");
 		break;
 	}
+	return 0;
+}
+
+
+// Send file contents
+static int send_file(struct client *client, const char *path, const char *proto) {
+	FILE *f, *p;
+	size_t flen;
+	char *cmd = NULL, mimetype[256], *ptr;
+	time_t t;
+	struct tm tm;
+	char date[64];
+
+	// Get time
+	t = time(NULL);
+	gmtime_r(&t, &tm);
+	strftime(date, sizeof(date), "%a, %d %b %y %H:%M:%S", &tm);
+
+	// Open file
+	if (!(f = fopen(path, "r"))) {
+		perror("[ERROR]: fopen()");
+		return -1;
+	}
+	// Get file size
+	fseek(f, 0L, SEEK_END);
+	flen = ftell(f);
+	fseek(f, 0L, SEEK_SET);
+	// Get mimetype (using "file" command")
+	if (asprintf(&cmd, "file --mime-type %s | awk '{print $2}'", path) < 0) {
+		perror("[ERROR]: asprintf()");
+		fclose(f);
+		return -1;
+	}
+	if (!(p = popen(cmd, "r"))) {
+		perror("[ERROR]: popen()");
+		free(cmd);
+		fclose(f);
+		return -1;
+	}
+	free(cmd);
+	if (!fgets(mimetype, sizeof(mimetype), p)) {
+		perror("[ERROR]: fgets()");
+		pclose(p);
+		fclose(f);
+		return -1;
+	}
+	if ((ptr = strchr(mimetype, '\n'))) {
+		*ptr = '\0';
+	}
+	pclose(p);
+	// Send header
+	client->wbuf_len = snprintf(client->wbuf, BUFSZ, "%s 200 OK\r\nServer: %s %s\r\n"
+					"Date: %s\r\nContent-type: %s\r\nContent-Length: %lu\r\n\r\n",
+					proto, SERVER_NAME, SERVER_VER, date, mimetype, flen);
+	while (write(client->fd, client->wbuf, client->wbuf_len) < 0) {
+		if (errno == EAGAIN) {
+			continue;
+		}
+		perror("[ERROR]: write()");
+		break;
+	}
+	// Send file
+	while ((client->wbuf_len = fread(client->wbuf, 1, BUFSZ, f))) {
+		// Write
+		while (write(client->fd, client->wbuf, client->wbuf_len) < 0) {
+			if (errno == EAGAIN) {
+				continue;
+			}
+			perror("[ERROR]: write()");
+			fclose(f);
+			return 0;
+		}
+	}
+	fclose(f);
+	return 0;
+}
+
+
+// Send response to GET request
+static void send_get_response(struct client *client, const char *uri, const char *proto) {
+	time_t t;
+	struct tm tm;
+	char date[64], *path = NULL, *ptr;
+	struct stat stat;
+
+	// Get time
+	t = time(NULL);
+	gmtime_r(&t, &tm);
+	strftime(date, sizeof(date), "%a, %d %b %y %H:%M:%S", &tm);
+
+	// Get path
+	if (asprintf(&path, "%s/%s", CWD, uri) < 0) {
+		perror("[ERROR]: asprintf()");
+		return;
+	}
+	// Check path
+	if (lstat(path, &stat)) {
+		fprintf(stderr, "[ERROR]: Could not access path: %s: %s\n", uri, strerror(errno));
+		// Is if an index.html file? Not found? Send directory listing
+		if ((ptr = strrchr(path, '/'))) {
+			ptr++;
+		} else {
+			ptr = path;
+		}
+		if (strcmp(ptr, "index.html")) {
+			goto send_404;
+		}
+		*ptr++ = '/';
+		*ptr = '\0';
+		if (send_dir(client, path, proto, uri) < 0) {
+			goto send_404;
+		}
+		goto out;
+	}
+	if (S_ISDIR(stat.st_mode)) {
+		if (send_dir(client, path, proto, uri) < 0) {
+			goto send_404;
+		}
+		goto out;
+	} else if (S_ISREG(stat.st_mode)) {
+		if (send_file(client, path, proto) < 0) {
+			goto send_404;
+		}
+		goto out;
+	}
+
+send_404:
+	client->wbuf_len = snprintf(client->wbuf, BUFSZ,
+			"%s 404 Not Found\r\nServer: %s %s\r\nDate: %s\r\n\r\n",
+			proto, SERVER_NAME, SERVER_VER, date);
+	while (write(client->fd, client->wbuf, client->wbuf_len) < 0) {
+		if (errno == EAGAIN) {
+			continue;
+		}
+		perror("[ERROR]: write()");
+		break;
+	}
+out:
+	// Free path
+	free(path);
 }
 
 
 // Send 501 Not Implemented
-static void send_unsupported(struct client *client, const char *proto, const char *ipstr,
-		unsigned port) {
+static void send_unsupported(struct client *client, const char *proto) {
 	time_t t;
 	struct tm tm;
 	char date[64];
@@ -125,7 +336,6 @@ static void send_unsupported(struct client *client, const char *proto, const cha
 	client->wbuf_len = snprintf(client->wbuf, BUFSZ,
 			"%s 501 Not Implemented\r\nServer: %s %s\r\nDate: %s\r\n\r\n",
 			proto, SERVER_NAME, SERVER_VER, date);
-	fprintf(stderr, "[INFO]: Response to client: %s:%u\n%s\n", ipstr, port, client->wbuf);
 	while (write(client->fd, client->wbuf, client->wbuf_len) < 0) {
 		if (errno == EAGAIN) {
 			continue;
@@ -163,20 +373,16 @@ static void* client_thread(void *arg) {
 			continue;
 		}
 		perror("[ERROR]: read()");
-		close(client->fd);
-		free(client);
-		return NULL;
+		goto out;
 	}
 	// Handle client closed
 	if (ret == 0) {
 		fprintf(stderr, "[INFO]: Connection closed from client: %s:%u\n", ipstr, port);
-		close(client->fd);
-		free(client);
-		return NULL;
+		goto out;
 	}
 	client->rbuf_len += ret;
 	client->rbuf[client->rbuf_len] = '\0';
-	fprintf(stderr, "[INFO]: Request from client: %s:%u\n%s\n", ipstr, port, client->rbuf);
+	fprintf(stderr, "[INFO]: Request from client: %s:%u\n%s", ipstr, port, client->rbuf);
 
 	// Parse request
 	ptr = client->rbuf;
@@ -186,18 +392,17 @@ static void* client_thread(void *arg) {
 
 	// Do we know this protocol?
 	if (strcmp(proto, "HTTP/1.1")) {
-		send_unsupported(client, "HTTP/1.1", ipstr, port);
-		close(client->fd);
-		free(client);
-		return NULL;
+		send_unsupported(client, "HTTP/1.1");
+		goto out;
 	}
 	// Is it a request we support?
 	if (!strcmp(req, "GET")) {
 		// Send GET response
-		send_get_response(client, uri, proto, ipstr, port);
+		send_get_response(client, uri, proto);
 	} else {
-		send_unsupported(client, proto, ipstr, port);
+		send_unsupported(client, proto);
 	}
+out:
 	close(client->fd);
 	free(client);
 	return NULL;

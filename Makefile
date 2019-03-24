@@ -1,6 +1,8 @@
+CC?=gcc
+
 tinyhttp: tinyhttp.c
-	gcc -o $@ $< -Wall -Wextra -O2 -lpthread
+	$(CC) -o $@ $< -Wall -Wextra -O2 -lpthread
 
 clean:
-	rm tinyhttp
+	rm -f tinyhttp
 
