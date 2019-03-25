@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <dirent.h>
 #include <netdb.h>
+#include <ifaddrs.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/types.h>
@@ -444,6 +445,32 @@ out:
 }
 
 
+// Print IP addresses server is listening on
+static void print_ip_addresses(const char *port) {
+	struct ifaddrs *ifa, *ptr;
+	void *addr;
+	char ipstr[INET6_ADDRSTRLEN];
+	fprintf(stderr, "[INFO]: Server started listening on port: %s\n", port);
+	if (getifaddrs(&ifa) < 0) {
+		perror("[ERROR]: getifaddrs()");
+		return;
+	}
+	fprintf(stderr, "[INFO]: Connect to inferfaces -\n");
+	for (ptr = ifa; ptr; ptr = ptr->ifa_next) {
+		if (ptr->ifa_addr->sa_family != AF_INET) {
+			continue;
+		}
+		addr = &((struct sockaddr_in*) ptr->ifa_addr)->sin_addr;
+		inet_ntop(ptr->ifa_addr->sa_family, addr, ipstr, sizeof(ipstr));
+		if (!*ipstr) {
+			continue;
+		}
+		fprintf(stderr, "        %-10s - %s:%s\n", ptr->ifa_name, ipstr, port);
+	}
+	freeifaddrs(ifa);
+}
+
+
 // Print usage/help
 static void print_usage(const char *progname) {
 	fprintf(stderr, "USAGE: %s <port>\n", progname);
@@ -469,7 +496,6 @@ int main(int argc, const char **argv) {
 	if ((sock = get_socket(argv[1], backlog)) < 0) {
 		return 1;
 	}
-	fprintf(stderr, "[INFO]: Server started listening on port: %s\n", argv[1]);
 	// Get CWD
 	while (1) {
 		if (!(CWD = malloc(CWDSZ + 64))) {
@@ -481,6 +507,8 @@ int main(int argc, const char **argv) {
 			break;
 		}
 	}
+	// Print IP addresses
+	print_ip_addresses(argv[1]);
 	while (1) {
 		addr_size = sizeof(client_addr);
 		// Accept connection
