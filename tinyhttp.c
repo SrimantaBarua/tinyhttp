@@ -457,10 +457,13 @@ static void print_ip_addresses(const char *port) {
 	}
 	fprintf(stderr, "[INFO]: Connect to inferfaces -\n");
 	for (ptr = ifa; ptr; ptr = ptr->ifa_next) {
-		if (ptr->ifa_addr->sa_family != AF_INET) {
+		if (!ptr->ifa_addr || ptr->ifa_addr->sa_family != AF_INET) {
 			continue;
 		}
 		addr = &((struct sockaddr_in*) ptr->ifa_addr)->sin_addr;
+		if (!addr) {
+			continue;
+		}
 		inet_ntop(ptr->ifa_addr->sa_family, addr, ipstr, sizeof(ipstr));
 		if (!*ipstr) {
 			continue;
